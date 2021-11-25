@@ -58,8 +58,9 @@ class PyiCloudPasswordFilter(logging.Filter):
 class PyiCloudSession(Session):
     """iCloud session."""
 
-    def __init__(self, service):
+    def __init__(self, service, session_data):
         self.service = service
+        self.session_data = session_data
         super().__init__()
 
     def request(self, method, url, **kwargs):  # pylint: disable=arguments-differ
@@ -87,10 +88,9 @@ class PyiCloudSession(Session):
                     {session_arg: response.headers.get(header)}
                 )
 
-        # Save session_data to file
-        with open(self.service.session_path, "w", encoding="utf-8") as outfile:
-            json.dump(self.service.session_data, outfile)
-            LOGGER.debug("Saved session data to file")
+        # Save session_data to data base
+        self.session_data.save(self.service.session_path, self.service.session_data)
+        LOGGER.debug("Saved session data to data base")
 
         # Save cookies to file
         self.cookies.save(ignore_discard=True, ignore_expires=True)
@@ -212,6 +212,7 @@ class PyiCloudService:
         verify=True,
         client_id=None,
         with_family=True,
+        force_refresh=False,
     ):
         if password is None:
             password = get_password_from_keyring(apple_id)
@@ -239,18 +240,14 @@ class PyiCloudService:
 
         LOGGER.debug("Using session file %s", self.session_path)
 
-        self.session_data = {}
-        try:
-            with open(self.session_path, encoding="utf-8") as session_f:
-                self.session_data = json.load(session_f)
-        except:  # pylint: disable=bare-except
-            LOGGER.info("Session file does not exist")
+        self.session = self.get_session()
+        self.session_data = self.session.session_data.load(self.session_path)
+
         if self.session_data.get("client_id"):
             self.client_id = self.session_data.get("client_id")
         else:
             self.session_data.update({"client_id": self.client_id})
 
-        self.session = PyiCloudSession(self)
         self.session.verify = verify
         self.session.headers.update(
             {"Origin": self.HOME_ENDPOINT, "Referer": "%s/" % self.HOME_ENDPOINT}
@@ -268,11 +265,14 @@ class PyiCloudService:
                 # successful authentication.
                 LOGGER.warning("Failed to read cookiejar %s", cookiejar_path)
 
-        self.authenticate()
+        self.authenticate(force_refresh=force_refresh)
 
         self._drive = None
         self._files = None
         self._photos = None
+
+    def get_session(self):
+        raise NotImplementedError
 
     def authenticate(self, force_refresh=False, service=None):
         """
@@ -345,6 +345,8 @@ class PyiCloudService:
             "dsWebAuthToken": self.session_data.get("session_token"),
             "extended_login": True,
             "trustToken": self.session_data.get("trust_token", ""),
+            "apple_id": self.user["accountName"],
+            "password": self.user["password"]
         }
 
         try:
@@ -400,6 +402,16 @@ class PyiCloudService:
         }
         if overrides:
             headers.update(overrides)
+        return headers
+
+    def _get_verification_headers(self):
+        headers = self._get_auth_headers({"Accept": "application/json"})
+
+        if self.session_data.get("scnt"):
+            headers["scnt"] = self.session_data.get("scnt")
+
+        if self.session_data.get("session_id"):
+            headers["X-Apple-ID-Session-Id"] = self.session_data.get("session_id")
         return headers
 
     @property
@@ -458,36 +470,41 @@ class PyiCloudService:
 
     def validate_verification_code(self, device, code):
         """Verifies a verification code received on a trusted device."""
-        device.update({"verificationCode": code, "trustBrowser": True})
-        data = json.dumps(device)
+        data = {
+            "phoneNumber": {
+                "id": device['deviceId']
+            },
+            "securityCode": {
+                "code": code
+            },
+            "mode": "sms"
+        }
+
+        headers = self._get_verification_headers()
 
         try:
             self.session.post(
-                "%s/validateVerificationCode" % self.SETUP_ENDPOINT,
-                params=self.params,
-                data=data,
+                "%s/verify/phone/securitycode" % self.AUTH_ENDPOINT,
+                data=json.dumps(data),
+                headers=headers,
             )
         except PyiCloudAPIResponseException as error:
             if error.code == -21669:
                 # Wrong verification code
+                LOGGER.error("Code verification failed.")
                 return False
             raise
 
-        self.trust_session()
+        LOGGER.debug("Code verification successful.")
 
+        self.trust_session()
         return not self.requires_2sa
 
     def validate_2fa_code(self, code):
         """Verifies a verification code received via Apple's 2FA system (HSA2)."""
         data = {"securityCode": {"code": code}}
 
-        headers = self._get_auth_headers({"Accept": "application/json"})
-
-        if self.session_data.get("scnt"):
-            headers["scnt"] = self.session_data.get("scnt")
-
-        if self.session_data.get("session_id"):
-            headers["X-Apple-ID-Session-Id"] = self.session_data.get("session_id")
+        headers = self._get_verification_headers()
 
         try:
             self.session.post(
@@ -509,13 +526,7 @@ class PyiCloudService:
 
     def trust_session(self):
         """Request session trust to avoid user log in going forward."""
-        headers = self._get_auth_headers()
-
-        if self.session_data.get("scnt"):
-            headers["scnt"] = self.session_data.get("scnt")
-
-        if self.session_data.get("session_id"):
-            headers["X-Apple-ID-Session-Id"] = self.session_data.get("session_id")
+        headers = self._get_verification_headers()
 
         try:
             self.session.get(
